@@ -1,0 +1,1014 @@
+From f2d7ddecab15dc1f8bf1aa00f0b1c5b6685eeb55 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 17 Oct 2026 12:29:27 +0000
+Subject: [PATCH] Xtube: dual subtitles, own package
+
+---
+ .../common/xtube/SecondSubtitlePicker.java    |  92 ++++++
+ .../common/xtube/SecondSubtitleView.java      | 303 ++++++++++++++++++
+ .../common/xtube/XtubeDualSubtitles.java      | 267 +++++++++++++++
+ .../common/xtube/XtubePrefs.java              |  74 +++++
+ .../src/stfdroid/res/values/strings.xml       |   2 +-
+ .../src/stfdroid/res/xml/searchable.xml       |   4 +-
+ smarttubetv/build.gradle                      |   6 +-
+ .../tv/ui/playback/PlaybackActivity.java      |   5 +
+ .../tv/ui/playback/PlaybackFragment.java      |  48 +++
+ .../main/res/layout/lb_playback_fragment.xml  |   8 +
+ .../src/stfdroid/res/values/strings.xml       |   4 +-
+ 11 files changed, 806 insertions(+), 7 deletions(-)
+ create mode 100644 common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/SecondSubtitlePicker.java
+ create mode 100644 common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/SecondSubtitleView.java
+ create mode 100644 common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/XtubeDualSubtitles.java
+ create mode 100644 common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/XtubePrefs.java
+
+diff --git a/common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/SecondSubtitlePicker.java b/common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/SecondSubtitlePicker.java
+new file mode 100644
+index 0000000..843c1c6
+--- /dev/null
++++ b/common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/SecondSubtitlePicker.java
+@@ -0,0 +1,92 @@
++package com.liskovsoft.smartyoutubetv2.common.xtube;
++
++import com.liskovsoft.mediaserviceinterfaces.data.MediaSubtitle;
++
++import java.util.List;
++import java.util.Locale;
++
++/**
++ * Xtube: chooses which caption track feeds the second subtitle.
++ * Order: a human-made track already in the target language, then a translation of a
++ * human-made track, then a translation of the auto-generated (asr) track.
++ */
++final class SecondSubtitlePicker {
++    static final class Choice {
++        final String baseUrl;
++        final String tlang; // null = use the track as is
++
++        Choice(String baseUrl, String tlang) {
++            this.baseUrl = baseUrl;
++            this.tlang = tlang;
++        }
++    }
++
++    private SecondSubtitlePicker() {
++    }
++
++    static Choice pick(List<MediaSubtitle> subtitles, String target) {
++        if (subtitles == null || subtitles.isEmpty() || target == null || target.isEmpty()) {
++            return null;
++        }
++
++        MediaSubtitle exactManual = null;
++        MediaSubtitle exactAny = null;
++        MediaSubtitle manualSource = null;
++        MediaSubtitle asrSource = null;
++
++        for (MediaSubtitle sub : subtitles) {
++            if (sub == null || sub.getBaseUrl() == null) {
++                continue;
++            }
++
++            boolean isAsr = "asr".equals(sub.getType());
++            boolean isTranslated = sub.getBaseUrl().contains("tlang=");
++            boolean matches = langMatches(sub.getLanguageCode(), target);
++
++            if (matches) {
++                if (exactAny == null) exactAny = sub;
++                if (!isAsr && !isTranslated && exactManual == null) exactManual = sub;
++            }
++
++            if (!isTranslated && sub.isTranslatable()) {
++                if (isAsr) {
++                    if (asrSource == null) asrSource = sub;
++                } else {
++                    if (manualSource == null) manualSource = sub;
++                }
++            }
++        }
++
++        if (exactManual != null) {
++            return new Choice(exactManual.getBaseUrl(), null);
++        }
++
++        MediaSubtitle source = manualSource != null ? manualSource : asrSource;
++
++        if (source != null) {
++            boolean sameLang = langMatches(source.getLanguageCode(), target);
++            return new Choice(source.getBaseUrl(), sameLang ? null : target);
++        }
++
++        return exactAny != null ? new Choice(exactAny.getBaseUrl(), null) : null;
++    }
++
++    static boolean langMatches(String code, String target) {
++        if (code == null || target == null) {
++            return false;
++        }
++
++        String c = code.toLowerCase(Locale.US).replace('_', '-');
++        String t = target.toLowerCase(Locale.US).replace('_', '-');
++
++        if (t.equals("zh-hans")) {
++            return c.equals("zh-hans") || c.equals("zh-cn") || c.equals("zh-sg") || c.equals("zh");
++        }
++
++        if (t.equals("zh-hant")) {
++            return c.equals("zh-hant") || c.equals("zh-tw") || c.equals("zh-hk") || c.equals("zh-mo");
++        }
++
++        return c.equals(t) || c.startsWith(t + "-");
++    }
++}
+diff --git a/common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/SecondSubtitleView.java b/common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/SecondSubtitleView.java
+new file mode 100644
+index 0000000..2263fa3
+--- /dev/null
++++ b/common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/SecondSubtitleView.java
+@@ -0,0 +1,303 @@
++package com.liskovsoft.smartyoutubetv2.common.xtube;
++
++import android.graphics.Color;
++import android.graphics.Typeface;
++import android.os.Handler;
++import android.os.Looper;
++import android.util.Log;
++import android.util.TypedValue;
++import android.view.Gravity;
++import android.view.View;
++import android.widget.FrameLayout;
++import android.widget.TextView;
++
++import com.liskovsoft.googlecommon.common.helpers.DefaultHeaders;
++import com.liskovsoft.sharedutils.okhttp.OkHttpManager;
++import com.liskovsoft.smartyoutubetv2.common.R;
++import com.liskovsoft.smartyoutubetv2.common.prefs.PlayerData;
++
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++
++import okhttp3.Request;
++import okhttp3.Response;
++import okhttp3.ResponseBody;
++
++/**
++ * Xtube: renders the second subtitle independently of ExoPlayer's text track selection.
++ * Downloads the caption track as json3 and shows the cue matching the current playback position.
++ */
++final class SecondSubtitleView {
++    interface PositionProvider {
++        long getPositionMs();
++    }
++
++    private static final String TAG = SecondSubtitleView.class.getSimpleName();
++    private static final long TICK_MS = 100;
++    private static final String PREVIEW_TEXT = "第二字幕 预览 · Second subtitle preview";
++
++    private final FrameLayout mContainer;
++    private final TextView mView;
++    private final PositionProvider mPosition;
++    private final XtubePrefs mPrefs;
++    private final PlayerData mPlayerData;
++    private final Handler mHandler = new Handler(Looper.getMainLooper());
++    private final ExecutorService mExecutor = Executors.newSingleThreadExecutor();
++
++    private List<Cue> mCues = Collections.emptyList();
++    private int mGeneration;
++    private boolean mRunning;
++    private boolean mPreview;
++    private boolean mReleased;
++    private int mLastW = -1;
++    private int mLastH = -1;
++
++    SecondSubtitleView(FrameLayout container, PositionProvider position, XtubePrefs prefs) {
++        mContainer = container;
++        mPosition = position;
++        mPrefs = prefs;
++        mPlayerData = PlayerData.instance(container.getContext());
++
++        mView = new TextView(container.getContext());
++        mView.setGravity(Gravity.CENTER);
++        mView.setTextColor(0xFFFFE680); // light yellow, distinct from the white main subtitle
++        mView.setTypeface(Typeface.DEFAULT_BOLD);
++        mView.setShadowLayer(4f, 0f, 0f, Color.BLACK);
++        mView.setBackgroundColor(0x99000000);
++        int pad = Math.round(6 * container.getResources().getDisplayMetrics().density);
++        mView.setPadding(pad * 2, pad / 2, pad * 2, pad / 2);
++        mView.setVisibility(View.GONE);
++        mView.setFocusable(false);
++
++        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
++                FrameLayout.LayoutParams.WRAP_CONTENT,
++                FrameLayout.LayoutParams.WRAP_CONTENT,
++                Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
++        container.addView(mView, lp);
++
++        // Re-layout only when the container size really changes (avoids requestLayout loops)
++        container.addOnLayoutChangeListener(mLayoutListener);
++    }
++
++    private final View.OnLayoutChangeListener mLayoutListener =
++            (v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
++                int w = right - left;
++                int h = bottom - top;
++                if (w != mLastW || h != mLastH) {
++                    mLastW = w;
++                    mLastH = h;
++                    mHandler.post(this::applyLayout);
++                }
++            };
++
++    // ---------------- loading ----------------
++
++    void load(String baseUrl, String tlang) {
++        final int generation = ++mGeneration;
++        mCues = Collections.emptyList();
++        hideIfNotPreview();
++
++        if (baseUrl == null || baseUrl.isEmpty() || mReleased) {
++            return;
++        }
++
++        final String url = buildUrl(baseUrl, tlang);
++
++        mExecutor.execute(() -> {
++            try {
++                final List<Cue> cues = parseJson3(download(url));
++                mHandler.post(() -> {
++                    if (generation == mGeneration) {
++                        mCues = cues;
++                    }
++                });
++            } catch (Exception e) {
++                Log.w(TAG, "Second subtitle load failed: " + url, e);
++            }
++        });
++    }
++
++    void clear() {
++        ++mGeneration;
++        mCues = Collections.emptyList();
++        hideIfNotPreview();
++    }
++
++    static String buildUrl(String baseUrl, String tlang) {
++        String url = baseUrl.replaceAll("(?<=[?&])(fmt|tlang)=[^&]*(&|$)", "");
++        while (url.endsWith("&") || url.endsWith("?")) {
++            url = url.substring(0, url.length() - 1);
++        }
++        url += (url.contains("?") ? "&" : "?") + "fmt=json3";
++        if (tlang != null && !tlang.isEmpty()) {
++            url += "&tlang=" + tlang;
++        }
++        return url;
++    }
++
++    private static String download(String url) throws IOException {
++        Request request = new Request.Builder()
++                .url(url)
++                .header("User-Agent", DefaultHeaders.APP_USER_AGENT)
++                .build();
++
++        try (Response response = OkHttpManager.instance().getClient().newCall(request).execute()) {
++            ResponseBody body = response.body();
++            if (!response.isSuccessful() || body == null) {
++                throw new IOException("HTTP " + response.code());
++            }
++            return body.string();
++        }
++    }
++
++    static List<Cue> parseJson3(String json) throws JSONException {
++        List<Cue> result = new ArrayList<>();
++        JSONArray events = new JSONObject(json).optJSONArray("events");
++
++        if (events == null) {
++            return result;
++        }
++
++        for (int i = 0; i < events.length(); i++) {
++            JSONObject event = events.optJSONObject(i);
++            if (event == null) continue;
++
++            JSONArray segs = event.optJSONArray("segs");
++            if (segs == null) continue;
++
++            StringBuilder text = new StringBuilder();
++            for (int j = 0; j < segs.length(); j++) {
++                JSONObject seg = segs.optJSONObject(j);
++                if (seg != null) text.append(seg.optString("utf8", ""));
++            }
++
++            String str = text.toString().trim();
++            long start = event.optLong("tStartMs", -1);
++            long duration = event.optLong("dDurationMs", 0);
++
++            // skip the pure line-break events of auto-generated captions
++            if (str.isEmpty() || start < 0 || duration <= 0) continue;
++
++            result.add(new Cue(start, start + duration, str));
++        }
++
++        Collections.sort(result, (a, b) -> Long.compare(a.start, b.start));
++        return result;
++    }
++
++    // ---------------- sync ----------------
++
++    private final Runnable mTick = new Runnable() {
++        @Override
++        public void run() {
++            if (!mRunning) return;
++            render();
++            mHandler.postDelayed(this, TICK_MS);
++        }
++    };
++
++    void start() {
++        if (mRunning || mReleased) return;
++        mRunning = true;
++        mHandler.post(mTick);
++    }
++
++    void release() {
++        mReleased = true;
++        mRunning = false;
++        mHandler.removeCallbacksAndMessages(null);
++        mExecutor.shutdownNow();
++        mContainer.removeOnLayoutChangeListener(mLayoutListener);
++        mContainer.removeView(mView);
++    }
++
++    private void render() {
++        if (mPreview) return;
++
++        Cue cue = mPrefs.isSecondEnabled() ? find(mCues, mPosition.getPositionMs()) : null;
++
++        if (cue == null) {
++            if (mView.getVisibility() != View.GONE) mView.setVisibility(View.GONE);
++        } else {
++            if (!cue.text.contentEquals(mView.getText())) mView.setText(cue.text);
++            if (mView.getVisibility() != View.VISIBLE) mView.setVisibility(View.VISIBLE);
++        }
++    }
++
++    private void hideIfNotPreview() {
++        if (!mPreview) mView.setVisibility(View.GONE);
++    }
++
++    /** Last cue with start <= pos; look back a few cues because auto captions overlap. */
++    static Cue find(List<Cue> cues, long pos) {
++        int lo = 0;
++        int hi = cues.size() - 1;
++        int idx = -1;
++
++        while (lo <= hi) {
++            int mid = (lo + hi) >>> 1;
++            if (cues.get(mid).start <= pos) {
++                idx = mid;
++                lo = mid + 1;
++            } else {
++                hi = mid - 1;
++            }
++        }
++
++        for (int i = idx; i >= 0 && i > idx - 5; i--) {
++            Cue cue = cues.get(i);
++            if (pos < cue.end) return cue;
++        }
++
++        return null;
++    }
++
++    // ---------------- layout / preview ----------------
++
++    void applyLayout() {
++        int w = mContainer.getWidth();
++        int h = mContainer.getHeight();
++        if (w == 0 || h == 0 || mReleased) return;
++
++        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) mView.getLayoutParams();
++        lp.bottomMargin = Math.round(h * mPrefs.getSecondPosition());
++        mView.setLayoutParams(lp);
++
++        // Same base size as SubtitleManager uses for the main subtitle, times our own scale
++        float mainSizePx = mContainer.getResources().getDimension(R.dimen.subtitle_text_size)
++                * mPlayerData.getSubtitleScale();
++        mView.setTextSize(TypedValue.COMPLEX_UNIT_PX, mainSizePx * mPrefs.getSecondScale());
++        mView.setMaxWidth(Math.round(w * 0.8f));
++    }
++
++    void setPreview(boolean preview) {
++        mPreview = preview;
++        if (preview) {
++            mView.setText(PREVIEW_TEXT);
++            mView.setVisibility(View.VISIBLE);
++        } else {
++            mView.setText("");
++            render();
++        }
++    }
++
++    static final class Cue {
++        final long start;
++        final long end;
++        final String text;
++
++        Cue(long start, long end, String text) {
++            this.start = start;
++            this.end = end;
++            this.text = text;
++        }
++    }
++}
+diff --git a/common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/XtubeDualSubtitles.java b/common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/XtubeDualSubtitles.java
+new file mode 100644
+index 0000000..df65df4
+--- /dev/null
++++ b/common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/XtubeDualSubtitles.java
+@@ -0,0 +1,267 @@
++package com.liskovsoft.smartyoutubetv2.common.xtube;
++
++import android.graphics.Color;
++import android.os.Handler;
++import android.os.Looper;
++import android.view.Gravity;
++import android.view.KeyEvent;
++import android.view.View;
++import android.widget.FrameLayout;
++import android.widget.TextView;
++
++import com.liskovsoft.mediaserviceinterfaces.data.MediaItemFormatInfo;
++import com.liskovsoft.mediaserviceinterfaces.data.MediaSubtitle;
++import com.liskovsoft.smartyoutubetv2.common.prefs.PlayerData;
++
++import java.util.List;
++import java.util.Locale;
++
++/**
++ * Xtube dual subtitles: entry point used by PlaybackFragment / PlaybackActivity.
++ *
++ * Remote control while playing:
++ *   BLUE    enter layout adjust mode
++ *   YELLOW  second subtitle on/off
++ *
++ * Adjust mode:
++ *   UP/DOWN     move the selected subtitle (1% of screen height per press, faster when held)
++ *   LEFT/RIGHT  second subtitle size
++ *   OK          switch between main and second subtitle
++ *   1/2/3/4     second subtitle language: 简体中文 / 繁體中文 / 日本語 / English
++ *   0           reset positions
++ *   BACK, BLUE  save and exit
++ *
++ * Positions are measured from the bottom edge as a percentage of the screen height.
++ * The main subtitle position is SmartTube's own setting (PlayerData.getSubtitlePosition()),
++ * so it stays in sync with Settings > Subtitles > Position.
++ */
++public final class XtubeDualSubtitles {
++    public interface PositionProvider {
++        long getPositionMs();
++    }
++
++    private static final float STEP = 0.01f;
++    private static final float SCALE_STEP = 0.05f;
++    private static final float DEFAULT_MAIN_POSITION = 0.1f; // SmartTube default
++    private static final String[] LANG_CODES = {"zh-Hans", "zh-Hant", "ja", "en"};
++    private static final String[] LANG_NAMES = {"简体中文", "繁體中文", "日本語", "English"};
++
++    private final XtubePrefs mPrefs;
++    private final PlayerData mPlayerData;
++    private final SecondSubtitleView mSecond;
++    private final TextView mHint;
++    private final Runnable mHideControls;
++    private final Handler mHandler = new Handler(Looper.getMainLooper());
++
++    private List<MediaSubtitle> mSubtitles;
++    private boolean mActive;
++    private boolean mTargetSecond = true;
++
++    /**
++     * @param overlay      full screen FrameLayout above the main SubtitleView
++     * @param position     current playback position (main thread)
++     * @param hideControls hides the player controls when adjust mode starts (may be null)
++     */
++    public XtubeDualSubtitles(FrameLayout overlay, PositionProvider position, Runnable hideControls) {
++        mPrefs = new XtubePrefs(overlay.getContext());
++        mPlayerData = PlayerData.instance(overlay.getContext());
++        mHideControls = hideControls;
++        mSecond = new SecondSubtitleView(overlay, position::getPositionMs, mPrefs);
++
++        mHint = new TextView(overlay.getContext());
++        mHint.setTextColor(Color.WHITE);
++        mHint.setTextSize(18);
++        mHint.setLineSpacing(0, 1.2f);
++        mHint.setBackgroundColor(0xCC000000);
++        int pad = Math.round(10 * overlay.getResources().getDisplayMetrics().density);
++        mHint.setPadding(pad * 2, pad, pad * 2, pad);
++        mHint.setGravity(Gravity.CENTER);
++        mHint.setVisibility(View.GONE);
++        mHint.setFocusable(false);
++        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
++                FrameLayout.LayoutParams.WRAP_CONTENT,
++                FrameLayout.LayoutParams.WRAP_CONTENT,
++                Gravity.TOP | Gravity.CENTER_HORIZONTAL);
++        lp.topMargin = pad * 3;
++        overlay.addView(mHint, lp);
++
++        mSecond.start();
++    }
++
++    // ---------------- video events ----------------
++
++    public void onFormatInfo(MediaItemFormatInfo formatInfo) {
++        mSubtitles = formatInfo != null ? formatInfo.getSubtitles() : null;
++        reload();
++    }
++
++    public void clear() {
++        mSubtitles = null;
++        mSecond.clear();
++    }
++
++    public void release() {
++        mHandler.removeCallbacksAndMessages(null);
++        mSecond.release();
++        if (mHint.getParent() instanceof FrameLayout) {
++            ((FrameLayout) mHint.getParent()).removeView(mHint);
++        }
++    }
++
++    private void reload() {
++        SecondSubtitlePicker.Choice choice = SecondSubtitlePicker.pick(mSubtitles, mPrefs.getSecondLang());
++        if (choice != null) {
++            mSecond.load(choice.baseUrl, choice.tlang);
++        } else {
++            mSecond.clear();
++        }
++    }
++
++    // ---------------- keys ----------------
++
++    /** @return true when the key was consumed and must not reach the player */
++    public boolean handleKey(KeyEvent event) {
++        int code = event.getKeyCode();
++        boolean down = event.getAction() == KeyEvent.ACTION_DOWN;
++        boolean up = event.getAction() == KeyEvent.ACTION_UP;
++
++        if (!mActive) {
++            if (code == KeyEvent.KEYCODE_PROG_BLUE) {
++                if (up) enter();
++                return true;
++            }
++            if (code == KeyEvent.KEYCODE_PROG_YELLOW) {
++                if (up) {
++                    boolean enabled = !mPrefs.isSecondEnabled();
++                    mPrefs.setSecondEnabled(enabled);
++                    flash(enabled ? "第二字幕：开" : "第二字幕：关");
++                }
++                return true;
++            }
++            return false;
++        }
++
++        // Exit on key up so the release event doesn't leak to the player as a BACK press
++        if (code == KeyEvent.KEYCODE_BACK || code == KeyEvent.KEYCODE_PROG_BLUE) {
++            if (up) exit();
++            return true;
++        }
++
++        if (!down) {
++            return true; // swallow everything else while adjusting
++        }
++
++        float accel = event.getRepeatCount() > 10 ? 3f : 1f;
++
++        switch (code) {
++            case KeyEvent.KEYCODE_DPAD_UP:
++                move(STEP * accel);
++                break;
++            case KeyEvent.KEYCODE_DPAD_DOWN:
++                move(-STEP * accel);
++                break;
++            case KeyEvent.KEYCODE_DPAD_RIGHT:
++                scale(SCALE_STEP);
++                break;
++            case KeyEvent.KEYCODE_DPAD_LEFT:
++                scale(-SCALE_STEP);
++                break;
++            case KeyEvent.KEYCODE_DPAD_CENTER:
++            case KeyEvent.KEYCODE_ENTER:
++            case KeyEvent.KEYCODE_NUMPAD_ENTER:
++                if (event.getRepeatCount() == 0) mTargetSecond = !mTargetSecond;
++                break;
++            case KeyEvent.KEYCODE_1:
++            case KeyEvent.KEYCODE_2:
++            case KeyEvent.KEYCODE_3:
++            case KeyEvent.KEYCODE_4:
++                if (event.getRepeatCount() == 0) setLang(code - KeyEvent.KEYCODE_1);
++                break;
++            case KeyEvent.KEYCODE_0:
++                if (event.getRepeatCount() == 0) resetLayout();
++                break;
++            default:
++                return true;
++        }
++
++        updateHint();
++        return true;
++    }
++
++    private void enter() {
++        mActive = true;
++        mTargetSecond = true;
++        if (mHideControls != null) mHideControls.run();
++        mHandler.removeCallbacksAndMessages(null);
++        mSecond.applyLayout();
++        mSecond.setPreview(true);
++        mHint.setVisibility(View.VISIBLE);
++        updateHint();
++    }
++
++    private void exit() {
++        mActive = false;
++        mSecond.setPreview(false);
++        mHint.setVisibility(View.GONE);
++    }
++
++    private void move(float delta) {
++        if (mTargetSecond) {
++            mPrefs.setSecondPosition(mPrefs.getSecondPosition() + delta);
++            mSecond.applyLayout();
++        } else {
++            // SubtitleManager listens to PlayerData changes and re-applies the position
++            float pos = XtubePrefs.round(XtubePrefs.clamp(mPlayerData.getSubtitlePosition() + delta, 0f, 0.95f));
++            mPlayerData.setSubtitlePosition(pos);
++        }
++    }
++
++    private void scale(float delta) {
++        if (mTargetSecond) {
++            mPrefs.setSecondScale(mPrefs.getSecondScale() + delta);
++            mSecond.applyLayout();
++        }
++    }
++
++    private void setLang(int index) {
++        if (index < 0 || index >= LANG_CODES.length) return;
++        mPrefs.setSecondLang(LANG_CODES[index]);
++        reload();
++    }
++
++    private void resetLayout() {
++        mPrefs.resetLayout();
++        mPlayerData.setSubtitlePosition(DEFAULT_MAIN_POSITION);
++        mSecond.applyLayout();
++    }
++
++    private void updateHint() {
++        String target = mTargetSecond ? "▶ 第二字幕" : "▶ 主字幕";
++        String main = String.format(Locale.US, "主字幕 距底部 %d%%", Math.round(mPlayerData.getSubtitlePosition() * 100));
++        String second = String.format(Locale.US, "第二字幕 距底部 %d%%  字号 %d%%  语言 %s%s",
++                Math.round(mPrefs.getSecondPosition() * 100),
++                Math.round(mPrefs.getSecondScale() * 100),
++                langName(mPrefs.getSecondLang()),
++                mPrefs.isSecondEnabled() ? "" : "（已关闭）");
++
++        mHint.setText("字幕调整　当前：" + target + "\n"
++                + main + "\n" + second + "\n"
++                + "↑↓ 位置　←→ 字号　OK 切换　1-4 语言　0 恢复默认　返回 保存退出");
++    }
++
++    private void flash(String text) {
++        mHandler.removeCallbacksAndMessages(null);
++        mHint.setText(text);
++        mHint.setVisibility(View.VISIBLE);
++        mHandler.postDelayed(() -> {
++            if (!mActive) mHint.setVisibility(View.GONE);
++        }, 2000);
++    }
++
++    private static String langName(String code) {
++        for (int i = 0; i < LANG_CODES.length; i++) {
++            if (LANG_CODES[i].equals(code)) return LANG_NAMES[i];
++        }
++        return code;
++    }
++}
+diff --git a/common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/XtubePrefs.java b/common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/XtubePrefs.java
+new file mode 100644
+index 0000000..b8a5999
+--- /dev/null
++++ b/common/src/main/java/com/liskovsoft/smartyoutubetv2/common/xtube/XtubePrefs.java
+@@ -0,0 +1,74 @@
++package com.liskovsoft.smartyoutubetv2.common.xtube;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++
++/**
++ * Xtube: second subtitle settings.
++ * Positions are a fraction of the player height measured from the bottom edge,
++ * the same convention SmartTube uses for the main subtitle (PlayerData.getSubtitlePosition()).
++ */
++public final class XtubePrefs {
++    public static final float DEFAULT_SECOND_POSITION = 0.22f;
++    public static final float DEFAULT_SECOND_SCALE = 0.85f;
++    public static final String DEFAULT_SECOND_LANG = "zh-Hans";
++
++    private static final String K_ENABLED = "second_enabled";
++    private static final String K_POSITION = "second_position";
++    private static final String K_SCALE = "second_scale";
++    private static final String K_LANG = "second_lang";
++
++    private final SharedPreferences mPrefs;
++
++    public XtubePrefs(Context context) {
++        mPrefs = context.getApplicationContext()
++                .getSharedPreferences("xtube_dual_subtitles", Context.MODE_PRIVATE);
++    }
++
++    public boolean isSecondEnabled() {
++        return mPrefs.getBoolean(K_ENABLED, true);
++    }
++
++    public void setSecondEnabled(boolean enabled) {
++        mPrefs.edit().putBoolean(K_ENABLED, enabled).apply();
++    }
++
++    public float getSecondPosition() {
++        return mPrefs.getFloat(K_POSITION, DEFAULT_SECOND_POSITION);
++    }
++
++    public void setSecondPosition(float position) {
++        mPrefs.edit().putFloat(K_POSITION, round(clamp(position, 0f, 0.95f))).apply();
++    }
++
++    /** Text size relative to the main subtitle (1.0 = same size). */
++    public float getSecondScale() {
++        return mPrefs.getFloat(K_SCALE, DEFAULT_SECOND_SCALE);
++    }
++
++    public void setSecondScale(float scale) {
++        mPrefs.edit().putFloat(K_SCALE, round(clamp(scale, 0.5f, 2.0f))).apply();
++    }
++
++    /** Target language of the second subtitle (YouTube language code, e.g. zh-Hans, zh-Hant, ja, en). */
++    public String getSecondLang() {
++        return mPrefs.getString(K_LANG, DEFAULT_SECOND_LANG);
++    }
++
++    public void setSecondLang(String lang) {
++        mPrefs.edit().putString(K_LANG, lang).apply();
++    }
++
++    public void resetLayout() {
++        mPrefs.edit().remove(K_POSITION).remove(K_SCALE).apply();
++    }
++
++    static float clamp(float v, float min, float max) {
++        return Math.max(min, Math.min(max, v));
++    }
++
++    /** Avoid float drift after many 1% steps. */
++    static float round(float v) {
++        return Math.round(v * 1000f) / 1000f;
++    }
++}
+diff --git a/leanbackassistant/src/stfdroid/res/values/strings.xml b/leanbackassistant/src/stfdroid/res/values/strings.xml
+index 5f6e4b8..28cff24 100644
+--- a/leanbackassistant/src/stfdroid/res/values/strings.xml
++++ b/leanbackassistant/src/stfdroid/res/values/strings.xml
+@@ -1,5 +1,5 @@
+ <resources translatable="false">
+     <string name="search_label">SmartTube</string>
+     <string name="settings_description">SmartTube Videos</string>
+-    <string name="search_authority">app.smarttube.fdroid.search_provider</string>
++    <string name="search_authority">com.xiao.xtube.search_provider</string>
+ </resources>
+diff --git a/leanbackassistant/src/stfdroid/res/xml/searchable.xml b/leanbackassistant/src/stfdroid/res/xml/searchable.xml
+index f66374d..6f0e774 100644
+--- a/leanbackassistant/src/stfdroid/res/xml/searchable.xml
++++ b/leanbackassistant/src/stfdroid/res/xml/searchable.xml
+@@ -18,9 +18,9 @@
+     android:label="@string/search_label"
+     android:icon="@drawable/lb_ic_in_app_search"
+     android:searchSettingsDescription="@string/settings_description"
+-    android:searchSuggestAuthority="app.smarttube.fdroid.search_provider"
++    android:searchSuggestAuthority="com.xiao.xtube.search_provider"
+     android:searchSuggestIntentAction="android.intent.action.VIEW"
+-    android:searchSuggestIntentData="content://app.smarttube.fdroid.search_provider/video"
++    android:searchSuggestIntentData="content://com.xiao.xtube.search_provider/video"
+     android:queryAfterZeroResults="true"
+     android:searchSuggestPath="search"
+     android:searchSuggestThreshold="0" />
+\ No newline at end of file
+diff --git a/smarttubetv/build.gradle b/smarttubetv/build.gradle
+index c34a90c..82ef5e3 100644
+--- a/smarttubetv/build.gradle
++++ b/smarttubetv/build.gradle
+@@ -123,7 +123,7 @@ android {
+     // https://stackoverflow.com/questions/18332474/how-to-set-versionname-in-apk-filename-using-gradle
+     applicationVariants.all { variant ->
+         variant.outputs.all { output ->
+-            def project = "SmartTube"
++            def project = "Xtube"
+             def flavor = variant.productFlavors[-1].name.substring(2) // remove st prefix
+             def buildType = variant.buildType.name.take(1)
+             def version = variant.versionName
+@@ -150,6 +150,7 @@ android {
+ 
+     lintOptions {
+         abortOnError true
++        checkReleaseBuilds false // Xtube
+         //checkReleaseBuilds false // fix for ClassNotFoundException: com.android.tools.lint.client.api.Vendor
+     }
+ 
+@@ -168,7 +169,8 @@ android {
+             targetSdkVersion project.properties.compileSdkVersion
+         }
+         stfdroid {
+-            applicationId "app.smarttube.fdroid"
++            // Xtube: own package, installs side by side with SmartTube
++            applicationId "com.xiao.xtube"
+             minSdkVersion 21
+             targetSdkVersion project.properties.compileSdkVersion
+ 
+diff --git a/smarttubetv/src/main/java/com/liskovsoft/smartyoutubetv2/tv/ui/playback/PlaybackActivity.java b/smarttubetv/src/main/java/com/liskovsoft/smartyoutubetv2/tv/ui/playback/PlaybackActivity.java
+index e49efae..296661d 100644
+--- a/smarttubetv/src/main/java/com/liskovsoft/smartyoutubetv2/tv/ui/playback/PlaybackActivity.java
++++ b/smarttubetv/src/main/java/com/liskovsoft/smartyoutubetv2/tv/ui/playback/PlaybackActivity.java
+@@ -57,6 +57,11 @@ public class PlaybackActivity extends LeanbackActivity {
+ 
+     @Override
+     public boolean dispatchKeyEvent(KeyEvent event) {
++        // Xtube: dual subtitle keys (blue / yellow, adjust mode)
++        if (mPlaybackFragment != null && mPlaybackFragment.xtubeHandleKey(event)) {
++            return true;
++        }
++
+         if (mPlaybackFragment != null) {
+             mPlaybackFragment.onDispatchKeyEvent(event);
+         }
+diff --git a/smarttubetv/src/main/java/com/liskovsoft/smartyoutubetv2/tv/ui/playback/PlaybackFragment.java b/smarttubetv/src/main/java/com/liskovsoft/smartyoutubetv2/tv/ui/playback/PlaybackFragment.java
+index 58d1049..36fa3b7 100644
+--- a/smarttubetv/src/main/java/com/liskovsoft/smartyoutubetv2/tv/ui/playback/PlaybackFragment.java
++++ b/smarttubetv/src/main/java/com/liskovsoft/smartyoutubetv2/tv/ui/playback/PlaybackFragment.java
+@@ -59,6 +59,7 @@ import com.liskovsoft.smartyoutubetv2.common.exoplayer.controller.ExoPlayerContr
+ import com.liskovsoft.smartyoutubetv2.common.exoplayer.other.DebugInfoManager;
+ import com.liskovsoft.smartyoutubetv2.common.exoplayer.other.ExoPlayerInitializer;
+ import com.liskovsoft.smartyoutubetv2.common.exoplayer.other.SubtitleManager;
++import com.liskovsoft.smartyoutubetv2.common.xtube.XtubeDualSubtitles;
+ import com.liskovsoft.smartyoutubetv2.common.exoplayer.selector.FormatItem;
+ import com.liskovsoft.smartyoutubetv2.common.exoplayer.versions.renderer.CustomOverridesRenderersFactory;
+ import com.liskovsoft.smartyoutubetv2.common.exoplayer.versions.selector.RestoreTrackSelector;
+@@ -113,6 +114,7 @@ public class PlaybackFragment extends SeekModePlaybackFragment implements Playba
+     private ExoPlayerController mExoPlayerController;
+     private ExoPlayerInitializer mPlayerInitializer;
+     private SubtitleManager mSubtitleManager;
++    private XtubeDualSubtitles mXtubeSubs;
+     private DebugInfoManager mDebugInfoManager;
+     private UriBackgroundManager mBackgroundManager;
+     private RowsSupportFragment mRowsSupportFragment;
+@@ -444,6 +446,10 @@ public class PlaybackFragment extends SeekModePlaybackFragment implements Playba
+         mExoPlayerController.release();
+         mPlayer = null;
+         mSubtitleManager = null;
++        if (mXtubeSubs != null) {
++            mXtubeSubs.release();
++            mXtubeSubs = null;
++        }
+         if (mYouTubeOverlay != null) {
+             mYouTubeOverlay
+                     .player(null)
+@@ -475,6 +481,40 @@ public class PlaybackFragment extends SeekModePlaybackFragment implements Playba
+         initializePixelRatio();
+ 
+         initializeDoubleTapHandler();
++
++        createXtubeSubtitles();
++    }
++
++    // Xtube: dual subtitles
++    private void createXtubeSubtitles() {
++        if (getView() == null || mXtubeSubs != null) {
++            return;
++        }
++
++        View overlay = getView().findViewById(R.id.xtube_subs_overlay);
++
++        if (overlay instanceof android.widget.FrameLayout) {
++            mXtubeSubs = new XtubeDualSubtitles((android.widget.FrameLayout) overlay,
++                    () -> mPlayer != null ? mPlayer.getCurrentPosition() : 0,
++                    () -> hideControlsOverlay(mIsUIAnimationsEnabled));
++        }
++    }
++
++    private void xtubeOnFormatInfo(MediaItemFormatInfo formatInfo) {
++        if (mXtubeSubs != null) {
++            mXtubeSubs.onFormatInfo(formatInfo);
++        }
++    }
++
++    private void xtubeClear() {
++        if (mXtubeSubs != null) {
++            mXtubeSubs.clear();
++        }
++    }
++
++    /** Xtube: called first from PlaybackActivity.dispatchKeyEvent */
++    public boolean xtubeHandleKey(KeyEvent event) {
++        return mXtubeSubs != null && mXtubeSubs.handleKey(event);
+     }
+ 
+     private void createPlayer() {
+@@ -945,41 +985,49 @@ public class PlaybackFragment extends SeekModePlaybackFragment implements Playba
+ 
+     @Override
+     public void openSabr(MediaItemFormatInfo formatInfo) {
++        xtubeOnFormatInfo(formatInfo);
+         mExoPlayerController.openSabr(formatInfo);
+     }
+ 
+     @Override
+     public void openDash(MediaItemFormatInfo formatInfo) {
++        xtubeOnFormatInfo(formatInfo);
+         mExoPlayerController.openDash(formatInfo);
+     }
+ 
+     @Override
+     public void openDash(InputStream dashManifest) {
++        xtubeClear();
+         mExoPlayerController.openDash(dashManifest);
+     }
+ 
+     @Override
+     public void openDashUrl(String dashManifestUrl) {
++        xtubeClear();
+         mExoPlayerController.openDashUrl(dashManifestUrl);
+     }
+ 
+     @Override
+     public void openHlsUrl(String hlsPlaylistUrl) {
++        xtubeClear();
+         mExoPlayerController.openHlsUrl(hlsPlaylistUrl);
+     }
+ 
+     @Override
+     public void openUrlList(List<String> urlList) {
++        xtubeClear();
+         mExoPlayerController.openUrlList(urlList);
+     }
+ 
+     @Override
+     public void openMerged(MediaItemFormatInfo formatInfo, String hlsPlaylistUrl) {
++        xtubeOnFormatInfo(formatInfo);
+         mExoPlayerController.openMerged(formatInfo, hlsPlaylistUrl);
+     }
+ 
+     @Override
+     public void openMerged(InputStream dashManifest, String hlsPlaylistUrl) {
++        xtubeClear();
+         mExoPlayerController.openMerged(dashManifest, hlsPlaylistUrl);
+     }
+ 
+diff --git a/smarttubetv/src/main/res/layout/lb_playback_fragment.xml b/smarttubetv/src/main/res/layout/lb_playback_fragment.xml
+index fde1ce7..2bc2022 100644
+--- a/smarttubetv/src/main/res/layout/lb_playback_fragment.xml
++++ b/smarttubetv/src/main/res/layout/lb_playback_fragment.xml
+@@ -31,6 +31,14 @@
+         android:paddingLeft="150sp"
+         android:paddingRight="150sp"/>
+ 
++    <!-- Xtube: second subtitle + adjust hint overlay -->
++    <FrameLayout
++        android:id="@+id/xtube_subs_overlay"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent"
++        android:focusable="false"
++        android:clickable="false"/>
++
+     <LinearLayout
+         android:id="@+id/live_chat_wrapper"
+         android:layout_width="300sp"
+diff --git a/smarttubetv/src/stfdroid/res/values/strings.xml b/smarttubetv/src/stfdroid/res/values/strings.xml
+index d5bcc69..12258ae 100644
+--- a/smarttubetv/src/stfdroid/res/values/strings.xml
++++ b/smarttubetv/src/stfdroid/res/values/strings.xml
+@@ -1,5 +1,5 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string translatable="false" name="app_name"><![CDATA[SmartTube F-Droid]]></string>
+-    <string translatable="false" name="browse_title"><![CDATA[SmartTube F-Droid]]></string>
++    <string translatable="false" name="app_name"><![CDATA[Xtube]]></string>
++    <string translatable="false" name="browse_title"><![CDATA[Xtube]]></string>
+ </resources>
+-- 
+2.43.0
+
